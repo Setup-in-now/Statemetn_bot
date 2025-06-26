@@ -3,7 +3,7 @@ import sqlite3
 import aiogram
 import re
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
+from aiogram.filters import Command, Filter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -12,6 +12,7 @@ import os
 import tempfile
 
 from PyPDF2 import PdfReader
+import fitz  # PyMuPDF
 
 API_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
 if not API_TOKEN:
@@ -52,7 +53,7 @@ def db_connect():
     c.execute('''CREATE TABLE IF NOT EXISTS requisites
                  (req TEXT PRIMARY KEY, date_time TEXT, trader TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS orders
-                 (id TEXT, req TEXT, UNIQUE(id, req), FOREIGN KEY(req) REFERENCES requisites(req))''')
+                 (id TEXT, req TEXT, FOREIGN KEY(req) REFERENCES requisites(req))''')
     c.execute('''CREATE TABLE IF NOT EXISTS seen_reqs (req TEXT PRIMARY KEY)''')
     conn.commit()
     return conn
@@ -390,29 +391,98 @@ async def process_delreq(message: types.Message, state: FSMContext):
     await state.clear()
 
 # ID группы, куда бот будет отправлять выписки и где слушает сообщения
-TARGET_GROUP_ID = -4654354066  # замените на ваш ID группы
-ALERT_CHAT_ID = -4654354066    # id чата alert-бота (может быть другой)
+TARGET_GROUP_ID = -1002762638022  # замените на ваш ID группы
+ALERT_CHAT_ID = -1002762638022    # id чата alert-бота (может быть другой)
 
-@dp.message()
+class IsReplyToPDF(Filter):
+    async def __call__(self, message: types.Message) -> bool:
+        return (
+            message.reply_to_message is not None and
+            message.reply_to_message.document is not None and
+            message.reply_to_message.document.file_name.lower().endswith('.pdf')
+        )
+
+class NotReplyToPDF(Filter):
+    async def __call__(self, message: types.Message) -> bool:
+        return not (
+            message.reply_to_message is not None and
+            message.reply_to_message.document is not None and
+            message.reply_to_message.document.file_name.lower().endswith('.pdf')
+        )
+
+@dp.message(IsReplyToPDF())
+async def handle_reply_search(message: types.Message):
+    print("handle_reply_search called", message.text)
+
+    if message.reply_to_message and message.reply_to_message.document:
+        doc = message.reply_to_message.document
+        if doc.file_name.lower().endswith('.pdf'):
+            file = await bot.get_file(doc.file_id)
+            file_path = file.file_path
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                await bot.download_file(file_path, tmp.name)
+                pdf_path = tmp.name
+            query = message.text.strip()
+            if not query:
+                await message.answer("Укажите, что искать в выписке.", reply_to_message_id=message.message_id)
+                return
+
+            # Получаем сумму из caption PDF-сообщения или из базы (пример: ищем в caption)
+            amount = None
+            if message.reply_to_message.caption:
+                # Пример: "Сумма 3000 найдена и выделена в выписке по реквизиту ..."
+                import re
+                m = re.search(r"Сумма (\d+)", message.reply_to_message.caption)
+                if m:
+                    amount = m.group(1)
+            # Если не нашли сумму — можно запросить у пользователя или не искать
+            if not amount:
+                await message.answer("Не удалось определить сумму для поиска совместно с запросом.", reply_to_message_id=message.message_id)
+                return
+
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                highlighted_path = tmp.name
+            if highlight_amount_and_query_in_pdf(pdf_path, amount, query, highlighted_path):
+                await message.answer_document(
+                    types.FSInputFile(highlighted_path),
+                    caption=f"Найдено совпадение по сумме {amount} и запросу '{query}'.",
+                    reply_to_message_id=message.message_id
+                )
+            else:
+                await message.answer(
+                    f"Совпадений по сумме {amount} и запросу '{query}' не найдено.",
+                    reply_to_message_id=message.message_id
+                )
+
+@dp.message(NotReplyToPDF())
 async def handle_group_message(message: types.Message):
+    print("handle_group_message called", message.text)
     if not message.text or message.chat.id != TARGET_GROUP_ID:
         return
 
     all_reqs = [r[0] for r in get_requisites()]
-    lines = [line.strip() for line in message.text.splitlines() if line.strip()]
+    lines = [line for line in message.text.splitlines() if line.strip()]
     if len(lines) < 2:
-        return  # Нужно минимум две строки: id и реквизит
-
-    possible_id = lines[0]
-    req = lines[-1]
-
-    # Проверяем, что реквизит — 10+ цифр
+        return
+    if len(lines) == 2:
+        amount = lines[0]
+        req = lines[1]
+        possible_id = None
+    elif len(lines) >= 3:
+        possible_id = lines[0]
+        amount = lines[1]
+        req = lines[-1]
+    else:
+        return
     if not re.fullmatch(r"\d{10,}", req):
         return
-
     if req not in all_reqs:
-        # Новый реквизит — алертим и добавляем в seen_reqs
-        await bot.send_message(ALERT_CHAT_ID, f"⚠️ Замечен новый реквизит: {req}")
+        # Новый реквизит — алертим и добавляем в seen_reqs (реплаем)
+        await bot.send_message(
+            ALERT_CHAT_ID,
+            f"⚠️ Замечен новый реквизит: {req}",
+            reply_to_message_id=message.message_id
+        )
         conn = db_connect()
         c = conn.cursor()
         c.execute("INSERT OR IGNORE INTO seen_reqs (req) VALUES (?)", (req,))
@@ -421,26 +491,156 @@ async def handle_group_message(message: types.Message):
     else:
         # Реквизит есть — добавляем id, если его ещё нет
         existing_ids = get_orders(req)
+        pdf_path = f"pdfs/{req}.pdf"
         if possible_id not in existing_ids:
             add_order(possible_id, req)
             await bot.send_message(
                 message.chat.id,
                 f"Добавлен ордер {possible_id} к реквизиту {req}"
             )
+            # Если есть PDF — отправить его обычным сообщением
+            if os.path.exists(pdf_path):
+                await bot.send_document(
+                    chat_id=TARGET_GROUP_ID,
+                    document=types.FSInputFile(pdf_path),
+                    caption=f"Выписка по реквизиту {req}"
+                )
+        else:
+            # Если ордер уже есть — только PDF реплаем, без текста!
+            if os.path.exists(pdf_path):
+                await bot.send_document(
+                    chat_id=TARGET_GROUP_ID,
+                    document=types.FSInputFile(pdf_path),
+                    caption=f"Выписка по реквизиту {req}",
+                    reply_to_message_id=message.message_id
+                )
+    if len(lines) >= 3:
+        amount = lines[1]  # сумма на второй строке
+    else:
+        amount = None
+
+    if os.path.exists(pdf_path) and amount:
+
+        amount = amount.replace(' ', '')
+        if pdf_contains_amount(pdf_path, amount):
+            await bot.send_message(
+                message.chat.id,
+                f"Сумма {amount} найдена в выписке по реквизиту {req}",
+                reply_to_message_id=message.message_id
+            )
         else:
             await bot.send_message(
                 message.chat.id,
-                f"Ордер {possible_id} уже есть для реквизита {req}"
+                f"Сумма {amount} не найдена в выписке по реквизиту {req}",
+                reply_to_message_id=message.message_id
             )
-        # Если есть PDF — отправить его
-        pdf_path = f"pdfs/{req}.pdf"
-        if os.path.exists(pdf_path):
+    if os.path.exists(pdf_path) and amount and pdf_contains_amount(pdf_path, amount):
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            highlighted_path = tmp.name
+        if highlight_amount_in_pdf(pdf_path, amount, highlighted_path):
             await bot.send_document(
                 chat_id=TARGET_GROUP_ID,
-                document=types.FSInputFile(pdf_path),
-                caption=f"Выписка по реквизиту {req}"
+                document=types.FSInputFile(highlighted_path),
+                caption=f"Сумма {amount} найдена и выделена в выписке по реквизиту {req}",
+                reply_to_message_id=message.message_id
             )
+        else:
+            await bot.send_message(
+                message.chat.id,
+                f"Сумма {amount} найдена, но выделить не удалось.",
+                reply_to_message_id=message.message_id
+            )
+def pdf_contains_amount(pdf_path, amount: str) -> bool:
+    try:
+        reader = PdfReader(pdf_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        text = text.replace('\xa0', ' ').replace('\u202f', ' ')
+        patterns = make_amount_regex(amount)
+        print("PATTERNS:", patterns)
+        for pattern in patterns:
+            if re.search(pattern, text):
+                return True
+        return False
+    except Exception:
+        return False
 
+def highlight_amount_in_pdf(pdf_path, amount, out_path):
+    doc = fitz.open(pdf_path)
+    found = False
+    patterns = make_amount_regex(amount)
+    for page in doc:
+        text = page.get_text("text").replace('\xa0', ' ').replace('\u202f', ' ')
+        print("=== PAGE TEXT ===")
+        print(repr(text))
+        for pattern in patterns:
+            for match in re.finditer(pattern, text):
+                inst = page.search_for(match.group())
+                for rect in inst:
+                    page.add_highlight_annot(rect)
+                    found = True
+    if found:
+        doc.save(out_path)
+    doc.close()
+    return found
+
+def highlight_text_in_pdf(pdf_path, text, out_path):
+    doc = fitz.open(pdf_path)
+    found = False
+    for page in doc:
+        for inst in page.search_for(text):
+            page.add_highlight_annot(inst)
+            found = True
+    if found:
+        doc.save(out_path)
+    doc.close()
+    return found
+def highlight_amount_and_query_in_pdf(pdf_path, amount, query, out_path):
+    doc = fitz.open(pdf_path)
+    found = False
+    patterns = make_amount_regex(amount)
+    for page in doc:
+        lines = [line.replace('\xa0', ' ').replace('\u202f', ' ') for line in page.get_text("text").splitlines()]
+        window_size = 10
+        for i in range(len(lines) - window_size + 1):
+            window = "\n".join(lines[i:i+window_size])
+            # Если в окне есть сумма и запрос
+            if any(re.search(pattern, window) for pattern in patterns) and re.search(re.escape(query), window, re.IGNORECASE):
+                print("Совпадение найдено в окне:\n", window)
+                # Теперь выделяем только строки, где есть сумма или запрос
+                for line in lines[i:i+window_size]:
+                    is_amount = any(re.search(pattern, line) for pattern in patterns)
+                    is_query = re.search(re.escape(query), line, re.IGNORECASE)
+                    if is_amount or is_query:
+                        for inst in page.search_for(line):
+                            page.add_highlight_annot(inst)
+                            found = True
+    if found:
+        doc.save(out_path)
+    doc.close()
+    return found
+def make_amount_regex(amount):
+    # amount: "10000"
+    spaced = f"{amount[:-3]}[ \xa0\u202f]?{amount[-3:]}" if len(amount) > 3 else amount
+    return [
+        rf"\+?{amount}[.,]00\s?₽",
+        rf"\+?{spaced}[.,]00\s?₽",
+        rf"\+?{amount}\s?₽",
+        rf"\+?{spaced}\s?₽",
+        rf"\+?{amount}[.,]00",
+        rf"\+?{spaced}[.,]00",
+        rf"\+?{amount}",
+        rf"\+?{spaced}",
+        rf"-{amount}[.,]00\s?₽",
+        rf"-{spaced}[.,]00\s?₽",
+        rf"-{amount}\s?₽",
+        rf"-{spaced}\s?₽",
+        rf"-{amount}[.,]00",
+        rf"-{spaced}[.,]00",
+        rf"-{amount}",
+        rf"-{spaced}",
+    ]
 if __name__ == "__main__":
     print("Бот запущен...")
     import asyncio
