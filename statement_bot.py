@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import aiogram
+import re
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -12,7 +13,9 @@ import tempfile
 
 from PyPDF2 import PdfReader
 
-API_TOKEN = '7462222631:AAF1yz4AtGOmRpBwSJSOL68Wrl7oV0gv2Us'
+API_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
+if not API_TOKEN:
+    raise ValueError("TELEGRAM_API_TOKEN environment variable not set")
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot=bot)
 
@@ -22,11 +25,12 @@ ADMIN_USERS = [6881852604, 7044014332]
 main_menu = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="Список выписок", callback_data="list")],
-        [InlineKeyboardButton(text="Добавить выписку", callback_data="add")],
+        [InlineKeyboardButton(text="Добавить реквезит", callback_data="add")],
         [InlineKeyboardButton(text="Добавить ордер", callback_data="add_id")],
         [InlineKeyboardButton(text="Мои ордера", callback_data="number")],
         [InlineKeyboardButton(text="Удалить выписку", callback_data="delreq")],
         [InlineKeyboardButton(text="Прикрепить выписку", callback_data="attach_pdf")],
+        [InlineKeyboardButton(text="Новые реквизиты", callback_data="seen_reqs")],
     ]
 )
 
@@ -49,6 +53,7 @@ def db_connect():
                  (req TEXT PRIMARY KEY, date_time TEXT, trader TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS orders
                  (id TEXT, req TEXT, FOREIGN KEY(req) REFERENCES requisites(req))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS seen_reqs (req TEXT PRIMARY KEY)''')
     conn.commit()
     return conn
 
@@ -104,13 +109,20 @@ def extract_req_from_pdf(file_path):
         text = ""
         for page in reader.pages:
             text += page.extract_text() or ""
-        import re
         match = re.search(r"\b\d{10,}\b", text)
         if match:
             return match.group(0)
         return None
     except Exception:
         return None
+
+def get_seen_reqs():
+    conn = db_connect()
+    c = conn.cursor()
+    c.execute("SELECT req FROM seen_reqs")
+    data = c.fetchall()
+    conn.close()
+    return [row[0] for row in data]
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
@@ -119,7 +131,6 @@ async def start_cmd(message: types.Message):
         reply_markup=main_menu
     )
 
-# Новый сценарий: ручной ввод реквизита для PDF
 @dp.callback_query()
 async def process_callback(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -211,6 +222,24 @@ async def process_callback(callback: types.CallbackQuery, state: FSMContext):
         msg = await callback.message.answer("Введите реквизит, к которому прикрепить PDF-файл:")
         await state.set_state(PDFReqStates.waiting_for_req)
         await state.update_data(bot_msg_ids=[msg.message_id])
+        try:
+            await callback.answer()
+        except aiogram.exceptions.TelegramBadRequest as e:
+            if "query is too old" in str(e):
+                pass
+            else:
+                raise
+    elif callback.data == "seen_reqs":
+        if user_id not in ADMIN_USERS:
+            msg = await callback.message.answer("У вас нет доступа к этой команде.")
+            await state.update_data(bot_msg_ids=[msg.message_id])
+        else:
+            seen = get_seen_reqs()
+            if not seen:
+                msg = await callback.message.answer("Нет новых замеченных реквизитов.")
+            else:
+                msg = await callback.message.answer("Замеченные реквизиты:\n" + "\n".join(seen))
+            await state.update_data(bot_msg_ids=[msg.message_id])
         try:
             await callback.answer()
         except aiogram.exceptions.TelegramBadRequest as e:
@@ -360,29 +389,50 @@ async def process_delreq(message: types.Message, state: FSMContext):
     await message.delete()
     await state.clear()
 
-# ID группы, куда бот будет отправлять выписки
+# ID группы, куда бот будет отправлять выписки и где слушает сообщения
 TARGET_GROUP_ID = -4654354066  # замените на ваш ID группы
+ALERT_CHAT_ID = -4654354066    # id чата alert-бота (может быть другой)
 
 @dp.message()
-async def forward_pdf_if_req_found(message: types.Message):
-    if message.text:
-        all_reqs = [r[0] for r in get_requisites()]
-        lines = [line.strip() for line in message.text.splitlines()]
-        for req in all_reqs:
-            for line in lines:
-                if req == line:
-                    pdf_path = f"pdfs/{req}.pdf"
-                    if os.path.exists(pdf_path):
-                        await bot.send_document(
-                            chat_id=TARGET_GROUP_ID,
-                            document=types.FSInputFile(pdf_path),
-                            caption=f"Выписка по реквизиту {req}"
+async def process_group_message(message: types.Message):
+    if not message.text or message.chat.id != TARGET_GROUP_ID:
+        return
+
+    all_reqs = [r[0] for r in get_requisites()]
+    lines = [line.strip() for line in message.text.splitlines()]
+
+    for i, line in enumerate(lines):
+        # Реквизит — 10+ цифр на отдельной строке
+        if re.fullmatch(r"\d{10,}", line):
+            req = line
+            if req not in all_reqs:
+                # Новый реквизит — алертим и добавляем в seen_reqs
+                await bot.send_message(ALERT_CHAT_ID, f"⚠️ Замечен новый реквизит: {req}")
+                conn = db_connect()
+                c = conn.cursor()
+                c.execute("INSERT OR IGNORE INTO seen_reqs (req) VALUES (?)", (req,))
+                conn.commit()
+                conn.close()
+            else:
+                # Реквизит есть — ищем id выше
+                if i > 0:
+                    possible_id = lines[i-1]
+                    # id — любая непустая строка, не похожая на реквизит
+                    if not re.fullmatch(r"\d{10,}", possible_id) and possible_id:
+                        add_order(possible_id, req)
+                        await bot.send_message(
+                            message.chat.id,
+                            f"Добавлен ордер {possible_id} к реквизиту {req}"
                         )
-                    return  # только первый найденный реквизит
-
-@dp.message()
-async def debug_all_messages(message: types.Message):
-    print(f"Получено сообщение из чата {message.chat.id}: {message.text}")
+                # Если есть PDF — отправить его
+                pdf_path = f"pdfs/{req}.pdf"
+                if os.path.exists(pdf_path):
+                    await bot.send_document(
+                        chat_id=TARGET_GROUP_ID,
+                        document=types.FSInputFile(pdf_path),
+                        caption=f"Выписка по реквизиту {req}"
+                    )
+            break  # только первый реквизит в сообщении
 
 if __name__ == "__main__":
     print("Бот запускается...")

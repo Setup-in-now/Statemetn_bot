@@ -1,10 +1,13 @@
 import asyncio
 import sqlite3
-from aiogram import Bot
+import re
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 from datetime import datetime, timedelta
 
 API_TOKEN = '8001292292:AAErSSPAftQ0hBkdAzhOpXzVrPnDta10N9Y'
 ALERT_CHAT_ID = -4654354066  # id чата для алертов
+SOURCE_CHAT_ID = -1001234567890  # id чата, где бот ищет новые реквизиты (замените на свой)
 
 def get_upcoming_requisites():
     """Все выписки, которые еще не наступили (date_time > сейчас)"""
@@ -36,12 +39,27 @@ def get_due_requisites():
     for req, date_time_str, trader in data:
         try:
             dt = datetime.strptime(date_time_str, "%d.%m.%Y %H:%M")
-            # Проверяем, что dt <= now, но не алертили ранее (можно добавить флаг в БД, если нужно)
             if dt <= now:
                 due.append((req, date_time_str, trader))
         except Exception:
             continue
     return due
+
+def req_in_main_table(req):
+    conn = sqlite3.connect("requisites.db")
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM requisites WHERE req=?", (req,))
+    found = c.fetchone() is not None
+    conn.close()
+    return found
+
+def add_seen_req(req):
+    conn = sqlite3.connect("requisites.db")
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS seen_reqs (req TEXT PRIMARY KEY)")
+    c.execute("INSERT OR IGNORE INTO seen_reqs (req) VALUES (?)", (req,))
+    conn.commit()
+    conn.close()
 
 async def report_loop(bot):
     """Отправляет отчет по всем ожидаемым выпискам в 12:00 и 20:00"""
@@ -80,12 +98,34 @@ async def alert_loop(bot):
                 already_alerted.add(key)
         await asyncio.sleep(60)
 
+async def handle_group_message(message: types.Message, bot: Bot):
+    # Только для сообщений из SOURCE_CHAT_ID
+    if message.chat.id != SOURCE_CHAT_ID:
+        return
+    if not message.text:
+        return
+    # Ищем все строки, похожие на реквизит (10+ цифр)
+    lines = [line.strip() for line in message.text.splitlines()]
+    for line in lines:
+        match = re.fullmatch(r"\d{10,}", line)
+        if match:
+            req = match.group(0)
+            if not req_in_main_table(req):
+                # Новый реквизит — алертим и заносим в seen_reqs
+                await bot.send_message(ALERT_CHAT_ID, f"⚠️ Замечен новый реквизит: {req}")
+                add_seen_req(req)
+            # Можно добавить логику для фиксации заявки по реквизиту
+            break
+
 async def main():
     bot = Bot(token=API_TOKEN)
+    dp = Dispatcher()
+    dp.message.register(lambda m: handle_group_message(m, bot))
     await bot.send_message(ALERT_CHAT_ID, "✅ Алерт-бот запущен и ожидает 12:00/20:00 для отправки отчетов и алертов по выпискам.")
     await asyncio.gather(
         report_loop(bot),
-        alert_loop(bot)
+        alert_loop(bot),
+        dp.start_polling(bot)
     )
 
 if __name__ == "__main__":
