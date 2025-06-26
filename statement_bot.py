@@ -52,7 +52,7 @@ def db_connect():
     c.execute('''CREATE TABLE IF NOT EXISTS requisites
                  (req TEXT PRIMARY KEY, date_time TEXT, trader TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS orders
-                 (id TEXT, req TEXT, FOREIGN KEY(req) REFERENCES requisites(req))''')
+                 (id TEXT, req TEXT, UNIQUE(id, req), FOREIGN KEY(req) REFERENCES requisites(req))''')
     c.execute('''CREATE TABLE IF NOT EXISTS seen_reqs (req TEXT PRIMARY KEY)''')
     conn.commit()
     return conn
@@ -75,7 +75,7 @@ def get_requisites():
 def add_order(id_, req):
     conn = db_connect()
     c = conn.cursor()
-    c.execute("INSERT INTO orders VALUES (?, ?)", (id_, req))
+    c.execute("INSERT OR IGNORE INTO orders VALUES (?, ?)", (id_, req))
     conn.commit()
     conn.close()
 
@@ -394,7 +394,7 @@ TARGET_GROUP_ID = -4654354066  # замените на ваш ID группы
 ALERT_CHAT_ID = -4654354066    # id чата alert-бота (может быть другой)
 
 @dp.message()
-async def process_group_message(message: types.Message):
+async def handle_group_message(message: types.Message):
     if not message.text or message.chat.id != TARGET_GROUP_ID:
         return
 
@@ -443,5 +443,5 @@ async def process_group_message(message: types.Message):
 
 if __name__ == "__main__":
     print("Бот запущен...")
-    from aiogram import executor
-    executor.start_polling(dp, skip_updates=True)
+    import asyncio
+    asyncio.run(dp.start_polling(bot))
