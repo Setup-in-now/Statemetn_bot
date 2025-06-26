@@ -399,60 +399,47 @@ async def process_group_message(message: types.Message):
         return
 
     all_reqs = [r[0] for r in get_requisites()]
-    lines = [line.strip() for line in message.text.splitlines()]
+    lines = [line.strip() for line in message.text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return  # Нужно минимум две строки: id и реквизит
 
-    for i, line in enumerate(lines):
-        # Реквизит — 10+ цифр на отдельной строке
-        if re.fullmatch(r"\d{10,}", line):
-            req = line
-            if req not in all_reqs:
-                # Новый реквизит — алертим и добавляем в seen_reqs
-                await bot.send_message(ALERT_CHAT_ID, f"⚠️ Замечен новый реквизит: {req}")
-                conn = db_connect()
-                c = conn.cursor()
-                c.execute("INSERT OR IGNORE INTO seen_reqs (req) VALUES (?)", (req,))
-                conn.commit()
-                conn.close()
-            else:
-                # Реквизит есть — ищем id выше
-                if i > 0:
-                    possible_id = lines[i-1]
-                    # id — любая непустая строка, не похожая на реквизит
-                    if not re.fullmatch(r"\d{10,}", possible_id) and possible_id:
-                        existing_ids = get_orders(req)
-                        pdf_path = f"pdfs/{req}.pdf"
-                        if possible_id in existing_ids:
-                            # Если id уже есть и есть PDF — отправляем PDF, но не добавляем id
-                            if os.path.exists(pdf_path):
-                                await bot.send_document(
-                                    chat_id=TARGET_GROUP_ID,
-                                    document=types.FSInputFile(pdf_path),
-                                    caption=f"Выписка по реквизиту {req}"
-                                )
-                        else:
-                            # Если PDF есть — отправляем PDF и НЕ добавляем id
-                            if os.path.exists(pdf_path):
-                                await bot.send_document(
-                                    chat_id=TARGET_GROUP_ID,
-                                    document=types.FSInputFile(pdf_path),
-                                    caption=f"Выписка по реквизиту {req}"
-                                )
-                            else:
-                                # PDF нет — добавляем id
-                                add_order(possible_id, req)
-                                await bot.send_message(
-                                    message.chat.id,
-                                    f"Добавлен ордер {possible_id} к реквизиту {req}"
-                                )
-                # Если есть PDF (и не было id выше) — отправить PDF
-                pdf_path = f"pdfs/{req}.pdf"
-                if os.path.exists(pdf_path):
-                    await bot.send_document(
-                        chat_id=TARGET_GROUP_ID,
-                        document=types.FSInputFile(pdf_path),
-                        caption=f"Выписка по реквизиту {req}"
-                    )
-            break  # только первый реквизит в сообщении
+    possible_id = lines[0]
+    req = lines[-1]
+
+    # Проверяем, что реквизит — 10+ цифр
+    if not re.fullmatch(r"\d{10,}", req):
+        return
+
+    if req not in all_reqs:
+        # Новый реквизит — алертим и добавляем в seen_reqs
+        await bot.send_message(ALERT_CHAT_ID, f"⚠️ Замечен новый реквизит: {req}")
+        conn = db_connect()
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO seen_reqs (req) VALUES (?)", (req,))
+        conn.commit()
+        conn.close()
+    else:
+        # Реквизит есть — добавляем id, если его ещё нет
+        existing_ids = get_orders(req)
+        if possible_id not in existing_ids:
+            add_order(possible_id, req)
+            await bot.send_message(
+                message.chat.id,
+                f"Добавлен ордер {possible_id} к реквизиту {req}"
+            )
+        else:
+            await bot.send_message(
+                message.chat.id,
+                f"Ордер {possible_id} уже есть для реквизита {req}"
+            )
+        # Если есть PDF — отправить его
+        pdf_path = f"pdfs/{req}.pdf"
+        if os.path.exists(pdf_path):
+            await bot.send_document(
+                chat_id=TARGET_GROUP_ID,
+                document=types.FSInputFile(pdf_path),
+                caption=f"Выписка по реквизиту {req}"
+            )
 
 if __name__ == "__main__":
     print("Бот запущен...")
