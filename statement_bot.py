@@ -419,12 +419,32 @@ async def process_group_message(message: types.Message):
                     possible_id = lines[i-1]
                     # id — любая непустая строка, не похожая на реквизит
                     if not re.fullmatch(r"\d{10,}", possible_id) and possible_id:
-                        add_order(possible_id, req)
-                        await bot.send_message(
-                            message.chat.id,
-                            f"Добавлен ордер {possible_id} к реквизиту {req}"
-                        )
-                # Если есть PDF — отправить его
+                        existing_ids = get_orders(req)
+                        pdf_path = f"pdfs/{req}.pdf"
+                        if possible_id in existing_ids:
+                            # Если id уже есть и есть PDF — отправляем PDF, но не добавляем id
+                            if os.path.exists(pdf_path):
+                                await bot.send_document(
+                                    chat_id=TARGET_GROUP_ID,
+                                    document=types.FSInputFile(pdf_path),
+                                    caption=f"Выписка по реквизиту {req}"
+                                )
+                        else:
+                            # Если PDF есть — отправляем PDF и НЕ добавляем id
+                            if os.path.exists(pdf_path):
+                                await bot.send_document(
+                                    chat_id=TARGET_GROUP_ID,
+                                    document=types.FSInputFile(pdf_path),
+                                    caption=f"Выписка по реквизиту {req}"
+                                )
+                            else:
+                                # PDF нет — добавляем id
+                                add_order(possible_id, req)
+                                await bot.send_message(
+                                    message.chat.id,
+                                    f"Добавлен ордер {possible_id} к реквизиту {req}"
+                                )
+                # Если есть PDF (и не было id выше) — отправить PDF
                 pdf_path = f"pdfs/{req}.pdf"
                 if os.path.exists(pdf_path):
                     await bot.send_document(
@@ -435,5 +455,6 @@ async def process_group_message(message: types.Message):
             break  # только первый реквизит в сообщении
 
 if __name__ == "__main__":
-    print("Бот запускается...")
-    asyncio.run(dp.start_polling(bot))
+    print("Бот запущен...")
+    from aiogram import executor
+    executor.start_polling(dp, skip_updates=True)
